@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { LIMITS, SERVICES, decide, machine, problemOf, say, settings } from './watchdog.mjs';
+import { LIMITS, PARTS, SERVICES, decide, machine, problemOf, say, settings } from './watchdog.mjs';
 
 // The watchdog for a Pixa API node (watchdog.mjs): what it calls a problem, what it does about one, run by run, and
 // what it says. It never touches a server here: readings are made up.
@@ -52,6 +52,8 @@ test('the restart is given five minutes, then the whole stack is made again, the
   const all = runs(minutes.map(stuck), null, 4);
   const acted = all.map((run, i) => (run.action ? [minutes[i], run.action.did] : null)).filter(Boolean);
   assert.deepEqual(acted, [[6, 'restart'], [11, 'recreate']]);
+  // Made again, the index is: never the node in front of it.
+  assert.deepEqual(all[7].action, { did: 'recreate', parts: ['hivemind_sync', 'hivemind', 'jussi'] });
   const gaveUp = all.flatMap((run, i) => run.events.filter((event) => event.kind === 'gave-up').map(() => minutes[i]));
   assert.deepEqual(gaveUp, [16]);
   assert.ok(all.slice(13).every((run) => run.status === 'needs-person' && run.action === null));
@@ -88,6 +90,35 @@ test('each problem has its own first remedy', () => {
   assert.deepEqual(first({ ...well(10), api: false }), { did: 'restart', service: 'jussi' });
   // Where the head is read through the router, a router that doesn't answer is what's restarted first.
   assert.deepEqual(first({ ...well(10), head: null }, settings({ NODE_WATCH_URL_SERVICE: 'jussi' }).first), { did: 'restart', service: 'jussi' });
+});
+
+test('an index stuck at a fork is taken past it, never only restarted (18 November 2026)', () => {
+  const now = T0 + 10 * MIN;
+  const last = { at: now - MIN, head: 2_000_180, haf: 2_000_180, index: 2_000_000 };
+  // Behind and not moving, with a fork next in HAF's queue for it.
+  assert.deepEqual(problemOf({ ...stuck(10), fork: true }, last, now), { problem: 'index-fork' });
+  assert.deepEqual(problemOf({ ...stuck(10), fork: false }, last, now), { problem: 'index-behind' });
+  assert.deepEqual(problemOf({ ...stuck(10), fork: null }, last, now), { problem: 'index-behind' });
+  // A fork waiting for an index that's keeping up, or gaining, is just the next thing it will do.
+  assert.deepEqual(problemOf({ ...well(10), fork: true }, last, now), { problem: 'well' });
+  assert.deepEqual(problemOf({ ...stuck(10), index: 2_000_100, fork: true }, last, now), { problem: 'catching-up' });
+  const minutes = Array.from({ length: 16 }, (_, i) => i + 4);
+  const all = runs(minutes.map((minute) => ({ ...stuck(minute), fork: true })), null, 4);
+  const acted = all.map((run, i) => (run.action ? [minutes[i], run.action] : null)).filter(Boolean);
+  assert.deepEqual(acted, [[6, { did: 'fork' }], [11, { did: 'recreate', parts: PARTS['index-fork'] }]]);
+});
+
+test('making things again never takes in the consensus node for a problem behind it', () => {
+  const second = (reading) => {
+    const minutes = Array.from({ length: 9 }, (_, i) => i + 4);
+    return runs(minutes.map((minute) => reading(minute)), null, 4).map((run) => run.action).filter(Boolean)[1];
+  };
+  assert.deepEqual(second((minute) => ({ ...well(minute), haf: 2_000_000, index: 2_000_000 })), { did: 'recreate', parts: ['pixagram_haf', 'hivemind_sync', 'hivemind', 'jussi'] });
+  assert.deepEqual(second((minute) => ({ ...well(minute), api: false })), { did: 'recreate', parts: ['hivemind', 'jussi'] });
+  for (const parts of Object.values(PARTS)) assert.ok(!parts.includes('pixagram'), parts.join());
+  // When the node itself is what's wrong, it's all of it, as before.
+  assert.deepEqual(second((minute) => ({ ...well(minute), head: null })), { did: 'recreate' });
+  assert.deepEqual(second((minute) => ({ ...well(minute), services: { ...running, pixagram: 'restarting' } })), { did: 'recreate' });
 });
 
 test('a service that was added to the list counts, and one that is not in it does not', () => {
@@ -165,7 +196,7 @@ test('every alert is a title and a sentence someone can act on', () => {
   });
   assert.equal(said({ kind: 'action', problem: 'index-behind', did: 'recreate', ok: true }).title, 'api-1: the watchdog recreated the whole stack');
   assert.equal(said({ kind: 'action', problem: 'down', detail: ['hivemind'], did: 'up', ok: true }).body, 'A container had stopped running (hivemind). It looks again in 5 minutes.');
-  assert.match(said({ kind: 'action', problem: 'api-down', did: 'restart', service: 'jussi', ok: false }).body, /tried to restart jussi, and Docker refused/);
+  assert.match(said({ kind: 'action', problem: 'api-down', did: 'restart', service: 'jussi', ok: false }).body, /tried to restart jussi, and it didn’t work/);
   assert.match(said({ kind: 'action', problem: 'index-behind', did: 'restart', service: 'hivemind_sync', ok: true, drill: true }).title, /a drill, the watchdog restarted hivemind_sync/);
   assert.match(said({ kind: 'gave-up', problem: 'index-behind', why: 'tried', steps: 2 }).body, /what the watchdog tried didn’t fix it.*never resyncs or replays/);
   assert.match(said({ kind: 'gave-up', problem: 'index-behind', why: 'often', steps: 1 }).body, /six times in a day/);
@@ -173,11 +204,18 @@ test('every alert is a title and a sentence someone can act on', () => {
   assert.equal(said({ kind: 'recovered', problem: 'index-behind', steps: 1 }).body, 'The Hivemind index had stopped keeping up with the chain. It took 1 step from the watchdog.');
   assert.match(said({ kind: 'recovered', problem: 'blind', steps: 0 }).body, /came back without the watchdog/);
   assert.match(said({ kind: 'test' }).title, /a test from the watchdog/);
+  assert.deepEqual(said({ kind: 'action', problem: 'index-fork', did: 'fork', ok: true }), {
+    title: 'api-1: the watchdog took the index past the fork',
+    body: 'The Hivemind index was stuck at a fork in the chain. It looks again in 5 minutes.',
+  });
+  assert.equal(said({ kind: 'action', problem: 'index-behind', did: 'recreate', parts: ['hivemind_sync', 'hivemind', 'jussi'], ok: true }).title, 'api-1: the watchdog recreated hivemind_sync, hivemind, jussi');
+  assert.match(said({ kind: 'action', problem: 'index-fork', did: 'fork', ok: false }).body, /tried to take the index past the fork, and it didn’t work/);
   // Everything decide() can tell has words, and none of them is a blank.
   const events = [];
-  for (const problem of ['down', 'unreachable', 'node-behind', 'haf-behind', 'index-behind', 'api-down', 'blind']) {
+  for (const problem of ['down', 'unreachable', 'node-behind', 'haf-behind', 'index-behind', 'index-fork', 'api-down', 'blind']) {
     for (const kind of ['action', 'gave-up', 'recovered']) events.push({ kind, problem, did: 'restart', service: 'x', why: 'tried', steps: 1, ok: true });
   }
+  for (const did of ['fork', 'recreate']) events.push({ kind: 'action', problem: 'index-fork', did, parts: did === 'recreate' ? PARTS['index-fork'] : undefined, ok: true });
   for (const event of events) {
     const { title, body } = said(event);
     assert.doesNotMatch(`${title} ${body}`, /undefined|null|Something was wrong/, JSON.stringify(event));
@@ -216,12 +254,18 @@ test('no more than six actions in a day: after that it asks for a person instead
 // --- The reading and the doing, with Docker and the node stood in for ---------------------------------------------------
 
 /** A stand-in for `docker compose`: answers psql and ps from what it's given, and keeps every command it was handed. */
-function stack({ haf = '2000100', least = '2000100', context = '2000090', ps = SERVICES.map((service) => `${service} running`).join('\n'), fail = [] } = {}) {
+function stack({ haf = '2000100', least = '2000100', context = '2000090', fork = ['0'], ps = SERVICES.map((service) => `${service} running`).join('\n'), fail = [] } = {}) {
   const ran = [];
+  // What the fork question answers, in turn: the last answer stands from then on.
+  const forks = [...fork];
   const run = (args) => {
     ran.push(args.join(' '));
     const line = args.join(' ');
     if (fail.some((part) => line.includes(part))) return { status: 1, stdout: '', stderr: 'no' };
+    if (line.includes('events_queue')) {
+      const answer = forks.length > 1 ? forks.shift() : forks[0];
+      return { status: answer === null ? 1 : 0, stdout: `${answer}\n` };
+    }
     if (line.includes('max(num)')) return { status: haf === null ? 1 : 0, stdout: `${haf}\n` };
     if (line.includes('select least(')) return { status: least === null ? 1 : 0, stdout: `${least}\n` };
     if (line.includes('hafd.contexts')) return { status: context === null ? 1 : 0, stdout: `${context}\n` };
@@ -244,7 +288,9 @@ test('it reads the head, HAF, the index and each service, and asks the router on
   const { run, ran } = stack();
   const ask = node({ 'http://127.0.0.1:7777': { 'condenser_api.get_dynamic_global_properties': head(2_000_100, T0) }, 'http://router': { 'condenser_api.get_follow_count': { account: 'null', follower_count: 0, following_count: 0 } } });
   const readings = await machine(config, { run, ask }).read(T0 + 2000);
-  assert.deepEqual(readings, { head: { number: 2_000_100, time: T0 }, other: null, haf: 2_000_100, index: 2_000_100, api: true, services: Object.fromEntries(SERVICES.map((service) => [service, 'running'])) });
+  assert.deepEqual(readings, { head: { number: 2_000_100, time: T0 }, other: null, haf: 2_000_100, index: 2_000_100, fork: false, api: true, services: Object.fromEntries(SERVICES.map((service) => [service, 'running'])) });
+  assert.equal((await machine(config, { ...stack({ fork: ['1'] }), ask }).read(T0)).fork, true);
+  assert.equal((await machine(config, { ...stack({ fork: [null] }), ask }).read(T0)).fork, null);
   // Reading changes nothing: every command is a question.
   assert.ok(ran.every((line) => line.startsWith('exec -T pixagram_haf psql -U haf_admin -d haf_block_log -At -c select ') || line.startsWith('ps ')), ran.join(' / '));
   // Nobody named a router: it isn't asked, and it isn't blamed.
@@ -283,11 +329,53 @@ test('what it does is one of three commands, each given time to stop cleanly, an
   assert.deepEqual(did({ did: 'restart', service: 'hivemind_sync' }), [true, ['restart -t 90 hivemind_sync']]);
   assert.deepEqual(did({ did: 'up' }), [true, ['up -d']]);
   assert.deepEqual(did({ did: 'recreate' }), [true, ['up -d --force-recreate -t 90', 'restart -t 90 jussi']]);
+  // Made again behind the node: only those parts, and nothing they depend on.
+  assert.deepEqual(did({ did: 'recreate', parts: ['hivemind_sync', 'hivemind', 'jussi'] }), [true, ['up -d --force-recreate -t 90 --no-deps hivemind_sync hivemind jussi', 'restart -t 90 jussi']]);
+  // A part this stack doesn't have is left out; with none left, it's everything.
+  assert.deepEqual(did({ did: 'recreate', parts: ['elsewhere'] }), [true, ['up -d --force-recreate -t 90', 'restart -t 90 jussi']]);
   // Docker refusing is said, and a stack that wasn't made again doesn't have its router restarted.
   assert.deepEqual(did({ did: 'restart', service: 'hivemind_sync' }, { fail: ['restart'] }), [false, ['restart -t 90 hivemind_sync']]);
   assert.deepEqual(did({ did: 'recreate' }, { fail: ['--force-recreate'] }), [false, ['up -d --force-recreate -t 90']]);
   // Nothing it can be asked to do removes, replays or resyncs anything.
-  for (const action of [{ did: 'restart', service: 'pixagram_haf' }, { did: 'up' }, { did: 'recreate' }]) {
+  for (const action of [{ did: 'restart', service: 'pixagram_haf' }, { did: 'up' }, { did: 'recreate' }, { did: 'recreate', parts: PARTS['haf-behind'] }]) {
     for (const line of did(action)[1]) assert.doesNotMatch(line, /\b(down|rm|kill|prune|replay|volume|exec)\b/, line);
   }
+});
+
+test('taking the index past its fork: the follower stopped, the one call kept as its owner, checked, and started again', () => {
+  const config = settings({ NODE_WATCH_STOP_SECONDS: '90' }, '/z', () => false);
+  const did = (more) => {
+    const { run, ran } = stack(more);
+    return [machine(config, { run }).perform({ did: 'fork' }), ran];
+  };
+  const call = "CALL hive.app_next_iteration(_contexts => ARRAY['hivemind_app']::hive.contexts_group, _blocks_range => (0,0), _limit => NULL, _override_max_batch => NULL, _wait => FALSE)";
+  const [ok, ran] = did({ fork: ['1', '0'] });
+  assert.equal(ok, true);
+  assert.equal(ran[0], 'stop -t 90 hivemind_sync');
+  assert.match(ran[1], /events_queue/);
+  assert.equal(ran[2], `exec -T pixagram_haf psql -U haf_admin -d haf_block_log -v ON_ERROR_STOP=1 -c START TRANSACTION -c SET LOCAL ROLE hivemind -c ${call} -c COMMIT`);
+  assert.match(ran[3], /events_queue/);
+  assert.equal(ran.at(-1), 'start hivemind_sync');
+  assert.equal(ran.length, 5);
+  // Still waiting on the fork after the step: it didn't work, and the follower is started all the same.
+  const [still, again] = did({ fork: ['1', '1'] });
+  assert.equal(still, false);
+  assert.equal(again.at(-1), 'start hivemind_sync');
+  // Hivemind got past it by itself as it stopped: nothing to call, and that's fine.
+  const [past, quiet] = did({ fork: ['0'] });
+  assert.equal(past, true);
+  assert.ok(!quiet.some((line) => line.includes('CALL')));
+  // Can't tell: nothing is called, it isn't done, and the follower is started again.
+  const [blind, unseen] = did({ fork: [null] });
+  assert.equal(blind, false);
+  assert.ok(!unseen.some((line) => line.includes('CALL')));
+  assert.equal(unseen.at(-1), 'start hivemind_sync');
+  // A follower that won't stop is never stepped around.
+  const [stuck, untouched] = did({ fork: ['1'], fail: ['stop'] });
+  assert.equal(stuck, false);
+  assert.deepEqual(untouched, ['stop -t 90 hivemind_sync']);
+  // The step's call fails: not done, follower started.
+  const [failed, tried] = did({ fork: ['1'], fail: ['CALL'] });
+  assert.equal(failed, false);
+  assert.equal(tried.at(-1), 'start hivemind_sync');
 });

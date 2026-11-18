@@ -5,13 +5,21 @@
 // the node answered, every container ran, and the newest post simply stayed the newest post. Docker restarts a part that
 // crashes, but nothing restarts one that's alive and has stopped working, and nothing says so.
 //
+// On 18 November 2026 a fork stopped Hivemind too, and no restart could move it: after a fork HAF's next iteration
+// rewinds the index and answers with no blocks, this Hivemind rolls any such empty answer back, fork and all, and asks
+// again for ever. The index's next event in HAF's queue is then the fork, every run. So that is read too, and the
+// remedy is to take that one step for it and keep it. The same day the whole stack, made again to fix the index, killed
+// the consensus node when it took over two minutes to stop, and it wouldn't start again until it was replayed: making
+// things again now takes in only the parts behind the one that's wrong, never the node for a problem behind it.
+//
 // Run once a minute as root (it speaks to Docker). Each run it reads, on this machine only: the chain's head from the
-// node, how far HAF has written the chain, how far the index (Hivemind) has read it, whether each container is running
-// and, if it's told where the router is, whether the router still answers for Hivemind. A problem seen three runs in a
-// row is acted on: first the one part is restarted; five minutes later, if that didn't do it and it has been allowed to
-// (NODE_WATCH_RECREATE=1), the whole stack is made again; after that it stops and says a person is needed. Nothing here
-// ever drops data, replays or syncs again from nothing: that's a person's decision. It touches only its own compose
-// project. At most six actions a day.
+// node, how far HAF has written the chain, how far the index (Hivemind) has read it, whether the index is waiting on a
+// fork, whether each container is running and, if it's told where the router is, whether the router still answers for
+// Hivemind. A problem seen three runs in a row is acted on: first the one part is restarted (or the index taken past its
+// fork); five minutes later, if that didn't do it and it has been allowed to (NODE_WATCH_RECREATE=1), that part and what
+// stands behind it are made again; after that it stops and says a person is needed. Nothing here ever drops data,
+// replays or syncs again from nothing: that's a person's decision. It touches only its own compose project. At most
+// six actions a day.
 //
 // What it found and did is written to its state folder (state.json, log.jsonl) and sent wherever it's told to send it:
 // a webhook (NODE_WATCH_WEBHOOK) or any command (NODE_WATCH_COMMAND). Everything it reads from the environment is in
@@ -50,20 +58,33 @@ export const LIMITS = {
 
 const DAY_MS = 86_400_000;
 
-// The first thing tried for each problem. The second is always the whole stack made again.
+// The first thing tried for each problem. The second is the stack made again: for a problem behind the node, only the
+// parts from that one back (PARTS), since a consensus node killed while it stops won't start without a replay.
 const FIRST = {
   down: { did: 'up' },
   unreachable: { did: 'restart', service: 'pixagram' },
   'node-behind': { did: 'restart', service: 'pixagram' },
   'haf-behind': { did: 'restart', service: 'pixagram_haf' },
   'index-behind': { did: 'restart', service: 'hivemind_sync' },
+  // Take the one step Hivemind keeps rolling back, and keep it (`fork` in `machine`).
+  'index-fork': { did: 'fork' },
   // The router resolves Hivemind's address once, when it starts, and answers 502 for it if Hivemind has moved since.
   'api-down': { did: 'restart', service: 'jussi' },
 };
 
+export const PARTS = {
+  'haf-behind': ['pixagram_haf', 'hivemind_sync', 'hivemind', 'jussi'],
+  'index-behind': ['hivemind_sync', 'hivemind', 'jussi'],
+  'index-fork': ['hivemind_sync', 'hivemind', 'jussi'],
+  'api-down': ['hivemind', 'jussi'],
+};
+
+/** What the second step does for a problem: everything, or the parts behind the node. */
+export const again = (problem) => (PARTS[problem] ? { did: 'recreate', parts: PARTS[problem] } : { did: 'recreate' });
+
 /**
  * What's wrong, if anything, from one run's readings and the run before's.
- * @param {{ head: { number: number, time: number } | null, other: number | null, haf: number | null, index: number | null, api?: boolean | null, services: Record<string, string> | null }} readings
+ * @param {{ head: { number: number, time: number } | null, other: number | null, haf: number | null, index: number | null, fork?: boolean | null, api?: boolean | null, services: Record<string, string> | null }} readings
  */
 export function problemOf(readings, last, now, limits = LIMITS) {
   const { head, other, haf, index, services } = readings;
@@ -82,7 +103,11 @@ export function problemOf(readings, last, now, limits = LIMITS) {
   // An index it can't read is one it can't vouch for: never "well".
   if (haf === null || index === null) return { problem: 'blind' };
   if (head.number - haf >= limits.lag) return gaining(haf, last?.haf) ? { problem: 'catching-up' } : { problem: 'haf-behind' };
-  if (haf - index >= limits.lag) return gaining(index, last?.index) ? { problem: 'catching-up' } : { problem: 'index-behind' };
+  if (haf - index >= limits.lag) {
+    if (gaining(index, last?.index)) return { problem: 'catching-up' };
+    // Behind, not moving, and the next thing waiting for it is a fork: restarting won't move it (18 November 2026).
+    return readings.fork === true ? { problem: 'index-fork' } : { problem: 'index-behind' };
+  }
   // Everything is keeping up, and the router still can't answer for the index: only asked where a router was named.
   if (readings.api === false) return { problem: 'api-down' };
   return { problem: 'well' };
@@ -140,7 +165,7 @@ export function decide(readings, memory, now, limits = LIMITS, first = FIRST) {
   const steps = incident?.steps ?? [];
   if (steps.length >= (limits.steps ?? 2)) return giveUp('tried');
   if (next.actions.length >= limits.dayActions) return giveUp('often');
-  const action = steps.length === 0 ? first[found.problem] : { did: 'recreate' };
+  const action = steps.length === 0 ? first[found.problem] : again(found.problem);
   next.incident = { problem: incident?.problem ?? found.problem, began: incident?.began ?? now, steps: [...steps, { at: now, ...action }], waitUntil: now + limits.settleMs, gaveUp: false };
   next.actions = [...next.actions, now];
   return out('acting', { action });
@@ -154,12 +179,13 @@ const PROBLEMS = {
   'node-behind': 'The node had lost the chain’s head',
   'haf-behind': 'HAF had stopped keeping up with the chain',
   'index-behind': 'The Hivemind index had stopped keeping up with the chain',
+  'index-fork': 'The Hivemind index was stuck at a fork in the chain',
   'api-down': 'The router wasn’t answering for Hivemind',
   blind: 'The watchdog couldn’t read how far HAF and the index had got',
 };
 
-const done = (step) => (step.did === 'restart' ? `restarted ${step.service}` : step.did === 'up' ? 'started what had stopped' : 'recreated the whole stack');
-const doing = (step) => (step.did === 'restart' ? `restart ${step.service}` : step.did === 'up' ? 'start what had stopped' : 'recreate the whole stack');
+const done = (step) => (step.did === 'restart' ? `restarted ${step.service}` : step.did === 'up' ? 'started what had stopped' : step.did === 'fork' ? 'took the index past the fork' : step.parts?.length ? `recreated ${step.parts.join(', ')}` : 'recreated the whole stack');
+const doing = (step) => (step.did === 'restart' ? `restart ${step.service}` : step.did === 'up' ? 'start what had stopped' : step.did === 'fork' ? 'take the index past the fork' : step.parts?.length ? `recreate ${step.parts.join(', ')}` : 'recreate the whole stack');
 
 /**
  * An event as an alert someone can act on: a title and a sentence or two. `name` is what to call this node.
@@ -184,7 +210,7 @@ export function say(event, name) {
   }
   const which = event.detail?.length ? ` (${event.detail.join(', ')})` : '';
   if (event.drill) return { title: `${name}: a drill, the watchdog ${done(event)}`, body: 'Nothing was wrong. This is what you’d be sent if something had been.' };
-  if (event.ok === false) return { title: `${name}: couldn’t be put right`, body: `${what}${which}. The watchdog tried to ${doing(event)}, and Docker refused. It looks again in 5 minutes.` };
+  if (event.ok === false) return { title: `${name}: couldn’t be put right`, body: `${what}${which}. The watchdog tried to ${doing(event)}, and it didn’t work. It looks again in 5 minutes.` };
   return { title: `${name}: the watchdog ${done(event)}`, body: `${what}${which}. It looks again in 5 minutes.` };
 }
 
@@ -275,6 +301,10 @@ export function machine(config, { run = null, ask: web = fetch } = {}) {
     const text = result.status === 0 ? String(result.stdout ?? '').trim() : '';
     return /^\d+$/.test(text) ? Number(text) : null;
   }
+  /** 1 when the next event in HAF's queue for the index is a fork, 0 when it isn't, null when that can't be read. */
+  function forkWaiting() {
+    return ask("select coalesce((select (e.event = 'BACK_FROM_FORK')::int from hafd.events_queue e where e.id > c.events_id order by e.id limit 1), 0) from hafd.contexts c where c.name = 'hivemind_app'");
+  }
   function servicesNow() {
     const result = compose(['ps', '--all', '--format', '{{.Service}} {{.State}}'], 20_000);
     if (result.status !== 0) return null;
@@ -286,6 +316,7 @@ export function machine(config, { run = null, ask: web = fetch } = {}) {
     // Someone else's head is only needed to tell this node losing the chain from the chain resting.
     const other = config.other && (!head || now - head.time >= config.limits.staleMs) ? (await headOf(web, config.other))?.number ?? null : null;
     const context = "(select current_block_num from hafd.contexts where name = 'hivemind_app')";
+    const forkNext = forkWaiting();
     return {
       head,
       other,
@@ -293,6 +324,7 @@ export function machine(config, { run = null, ask: web = fetch } = {}) {
       // How far the index has really got: the lower of where HAF has it and what Hivemind says it has finished, or
       // HAF's word alone where this Hivemind keeps no such note.
       index: ask(`select least(${context}, (select last_completed_block_num from hivemind_app.hive_state))`) ?? ask(`select ${context}`),
+      fork: forkNext === null ? null : forkNext === 1,
       api: config.api && head ? await answersForIndex(web, config.api) : null,
       services: servicesNow(),
     };
@@ -302,11 +334,36 @@ export function machine(config, { run = null, ask: web = fetch } = {}) {
     const one = (config.stopSeconds + 120) * 1000;
     if (action.did === 'restart') return compose(['restart', ...grace, action.service], one).status === 0;
     if (action.did === 'up') return compose(['up', '-d'], one).status === 0;
+    if (action.did === 'fork') return pastFork(grace, one);
+    // Only the parts behind what's wrong, where that's known and they're this stack's; everything otherwise.
+    const parts = (action.parts ?? []).filter((service) => config.services.includes(service));
+    const which = parts.length ? ['--no-deps', ...parts] : [];
     // Long enough for every container to be given its time to stop, one after another.
-    if (compose(['up', '-d', '--force-recreate', ...grace], (config.stopSeconds * (config.services.length + 2) + 120) * 1000).status !== 0) return false;
+    if (compose(['up', '-d', '--force-recreate', ...grace, ...which], (config.stopSeconds * ((parts.length || config.services.length) + 2) + 120) * 1000).status !== 0) return false;
     // The router resolved Hivemind's address as it started, perhaps before Hivemind had its new one, and would answer
     // 502 for it from then on: the stack's own README restarts it last after anything that recreates Hivemind.
     return !config.services.includes('jussi') || compose(['restart', ...grace, 'jussi'], one).status === 0;
+  }
+  /**
+   * Takes the index past the fork it's stuck at: with its follower stopped, the very call it makes each time, as its
+   * owner, in a transaction that's kept this time. HAF rewinds the index's tables to the fork's block and moves it on to
+   * the new branch; the follower, started again, carries on from there. Done only when the fork is still what's next,
+   * and judged done only when it no longer is.
+   */
+  function pastFork(grace, one) {
+    if (compose(['stop', ...grace, 'hivemind_sync'], one).status !== 0) return false;
+    // Hivemind may have got past it by itself as it stopped: then there's nothing to do.
+    const before = forkWaiting();
+    let ok = before === 0;
+    if (before === 1) {
+      const step = compose(['exec', '-T', 'pixagram_haf', 'psql', '-U', 'haf_admin', '-d', 'haf_block_log', '-v', 'ON_ERROR_STOP=1',
+        '-c', 'START TRANSACTION', '-c', 'SET LOCAL ROLE hivemind',
+        '-c', "CALL hive.app_next_iteration(_contexts => ARRAY['hivemind_app']::hive.contexts_group, _blocks_range => (0,0), _limit => NULL, _override_max_batch => NULL, _wait => FALSE)",
+        '-c', 'COMMIT'], 60_000);
+      ok = step.status === 0 && forkWaiting() === 0;
+    }
+    // The follower is started again whatever happened: a stopped index is worse than a stuck one.
+    return compose(['start', 'hivemind_sync'], one).status === 0 && ok;
   }
   return { read, perform };
 }
@@ -392,7 +449,7 @@ async function main(flags) {
   if (decision.action) {
     const ok = perform(decision.action);
     events.push({ kind: 'action', problem: decision.memory.incident.problem, detail: decision.detail, ...decision.action, ok });
-    console.log(`${decision.memory.incident.problem}: ${decision.action.did} ${decision.action.service ?? 'everything'}: ${ok ? 'done' : 'failed'}`);
+    console.log(`${decision.memory.incident.problem}: ${decision.action.did} ${decision.action.service ?? decision.action.parts?.join(',') ?? (decision.action.did === 'fork' ? 'hivemind_sync' : 'everything')}: ${ok ? 'done' : 'failed'}`);
   }
   for (const event of decision.events) {
     events.push(event);
@@ -404,7 +461,7 @@ async function main(flags) {
     status: decision.status,
     problem: decision.problem,
     detail: decision.detail,
-    readings: { head: readings.head?.number ?? null, headTime: readings.head?.time ?? null, haf: readings.haf, index: readings.index, api: readings.api },
+    readings: { head: readings.head?.number ?? null, headTime: readings.head?.time ?? null, haf: readings.haf, index: readings.index, fork: readings.fork, api: readings.api },
     incident: decision.memory.incident,
     limits: { lag: config.limits.lag, confirm: config.limits.confirm, settleMs: config.limits.settleMs, dayActions: config.limits.dayActions },
   });

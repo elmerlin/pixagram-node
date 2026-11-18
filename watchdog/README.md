@@ -13,6 +13,19 @@ Nothing restarts that and nothing reports it, because by every check Docker has,
 The only thing that shows it is a comparison between the chain's head and how far the index has got. That
 comparison is what this makes, once a minute.
 
+On 18 November 2026 it happened again, for a different reason, and a restart couldn't fix it. A one-block fork at
+block 2,161,260 (14:13 UTC) put a `BACK_FROM_FORK` event in HAF's queue for Hivemind. HAF's next iteration rewinds the
+app's tables to the fork and returns an empty block range. This Hivemind build (1.28.8) rolls back every empty
+iteration (`_idle_until_new_block`), so the rewind and the context's move to the new branch were rolled back with it.
+It asked again and got the same answer, for ever: `hafd.contexts` for `hivemind_app` stood at the same `events_id`,
+with the fork as the next event. Restarting `hivemind_sync`, or the whole stack, changes nothing. What fixes it is
+taking that one iteration for Hivemind and committing it. The watchdog now does that.
+
+The same afternoon, remaking the whole stack to fix the index killed `pixagram` when it didn't stop within two
+minutes. Its account history was saved one block short of its state, and it refused to start (`Inconsistency in last
+irreversible block`) until it was replayed with `--force-replay`. So a remake now leaves the consensus node alone
+unless the node is what's wrong.
+
 ## What it does
 
 Each run it reads, on this machine only:
@@ -22,6 +35,7 @@ Each run it reads, on this machine only:
 | the chain's head | hived, `condenser_api.get_dynamic_global_properties` |
 | how far HAF has written | `select max(num) from hafd.blocks` |
 | how far Hivemind has read | the lower of `hafd.contexts.current_block_num` for `hivemind_app` and `hivemind_app.hive_state.last_completed_block_num` |
+| whether a fork is waiting for Hivemind | whether the next row of `hafd.events_queue` after the context's `events_id` is a `BACK_FROM_FORK` |
 | whether each service is running | `docker compose ps` |
 | whether the router still answers for Hivemind | one small call through it, only if you say where it is (`NODE_WATCH_API`) |
 
@@ -34,6 +48,7 @@ and gives what it finds one of these names:
 | `node-behind` | the head is 3 minutes old and another node is 60 blocks ahead | restart `pixagram` |
 | `haf-behind` | HAF is 60 blocks (3 minutes) behind the head and not gaining | restart `pixagram_haf` |
 | `index-behind` | Hivemind is 60 blocks behind HAF and not gaining | restart `hivemind_sync` |
+| `index-fork` | the same, and the next thing waiting for it is a fork | take it past the fork (below) |
 | `api-down` | everything is keeping up, and the router can't answer for Hivemind | restart `jussi` |
 | `catching-up` | behind, but gaining on the head | none |
 | `chain-quiet` | the head is old and nobody else is ahead | none |
@@ -42,14 +57,23 @@ and gives what it finds one of these names:
 A finding has to be there three runs in a row before anything is done about it. Then:
 
 1. the first step above;
-2. five minutes later, if it is still so and you have allowed it (`NODE_WATCH_RECREATE=1`), the whole stack
-   again: `docker compose up -d --force-recreate`, then `docker compose restart jussi`;
+2. five minutes later, if it is still so and you have allowed it (`NODE_WATCH_RECREATE=1`), the stack made again
+   from the part that's wrong back: `docker compose up -d --force-recreate --no-deps` with `hivemind_sync hivemind
+   jussi` for the index or the router, with `pixagram_haf` as well for HAF, and the whole stack only when `pixagram`
+   itself is what's wrong; then `docker compose restart jussi`;
 3. five minutes after that, it stops and says a person is needed.
 
 Two good runs in a row and it is well again, and says so.
 
 Step 2 is off unless you turn it on, because it takes the public API away for as long as the stack takes to come
 back. Without it the watchdog restarts the one part and then asks for you.
+
+Taking the index past a fork: `hivemind_sync` is stopped, then as `haf_admin` with `SET LOCAL ROLE hivemind` (the
+context's owner) the same call Hivemind makes, `CALL hive.app_next_iteration(_contexts => ARRAY['hivemind_app'],
+_blocks_range => (0,0), _limit => NULL, _override_max_batch => NULL, _wait => FALSE)`, is made in a transaction that
+is committed; then `hivemind_sync` is started again, whatever happened. It is only done while the fork is still the
+next event, and counted as done only once it isn't. On our node, by hand, Hivemind was at the head in under a minute
+afterwards.
 
 `api-down`, and the Jussi restart that ends step 2, are there because of the note under Upgrading in this
 repository's README: Jussi resolves Hivemind's address once, when it starts, and answers 502 on `bridge.*` if
@@ -58,7 +82,8 @@ Hivemind has moved since.
 ## What it never does
 
 - It never deletes anything, replays or resyncs. Those are a person's decision.
-- It never touches anything outside this compose project.
+- It never touches anything outside this compose project. The one thing it does in a database is the iteration
+  Hivemind itself makes, above.
 - It never acts more than six times in a day. After that it stops and says so.
 - It never acts on a chain that has stopped for everyone, or on a part that is catching up.
 - It never calls an index it couldn't read "well".
